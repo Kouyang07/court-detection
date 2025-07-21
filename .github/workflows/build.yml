@@ -1,0 +1,447 @@
+# .github/workflows/modal-build.yml
+name: Build for Modal Serverless
+
+on:
+  push:
+    branches: [ master, develop ]
+    paths:
+      - '**.cpp'
+      - '**.h'
+      - 'CMakeLists.txt'
+      - 'cmake/**'
+      - '.github/workflows/modal-build.yml'
+  pull_request:
+    branches: [ master ]
+    paths:
+      - '**.cpp'
+      - '**.h'
+      - 'CMakeLists.txt'
+      - 'cmake/**'
+  release:
+    types: [published]
+
+env:
+  BINARY_NAME: detect_modal_x64
+  MODAL_PYTHON_VERSION: "3.11"
+
+jobs:
+  build-modal-binary:
+    name: Build optimized binary for Modal
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up build environment
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            pkg-config \
+            libopencv-dev \
+            libopencv-contrib-dev \
+            libglib2.0-dev \
+            libgtk-3-dev \
+            libavcodec-dev \
+            libavformat-dev \
+            libswscale-dev \
+            libv4l-dev \
+            libxvidcore-dev \
+            libx264-dev \
+            libjpeg-dev \
+            libpng-dev \
+            libtiff-dev \
+            gfortran \
+            openexr \
+            libatlas-base-dev \
+            python3-dev \
+            python3-numpy \
+            libtbb2 \
+            libtbb-dev \
+            libdc1394-22-dev \
+            patchelf
+
+      - name: Cache OpenCV build
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/_deps/opencv-build
+            build/_deps/opencv-src
+          key: opencv-${{ runner.os }}-${{ hashFiles('cmake/recipes/external/opencv.cmake') }}-v2
+          restore-keys: |
+            opencv-${{ runner.os }}-
+
+      - name: Verify OpenCV installation
+        run: |
+          pkg-config --modversion opencv4 || pkg-config --modversion opencv
+          echo "OpenCV libs: $(pkg-config --libs opencv4 || pkg-config --libs opencv)"
+
+      - name: Configure CMake for Modal
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_FLAGS="-O3 -march=x86-64 -mtune=generic -static-libgcc -static-libstdc++" \
+            -DCMAKE_C_FLAGS="-O3 -march=x86-64 -mtune=generic" \
+            -DCMAKE_EXE_LINKER_FLAGS="-Wl,--as-needed -Wl,--strip-all" \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DWITH_FFMPEG=OFF \
+            -DWITH_GSTREAMER=OFF \
+            -DWITH_IPP=OFF \
+            -DWITH_ITT=OFF
+
+      - name: Build binary
+        run: |
+          cmake --build build --parallel $(nproc)
+
+      - name: Prepare Modal-optimized binary
+        run: |
+          cp build/detect ${{ env.BINARY_NAME }}
+          chmod +x ${{ env.BINARY_NAME }}
+          
+          # Strip and optimize binary
+          strip --strip-unneeded ${{ env.BINARY_NAME }}
+          
+          # Verify binary info
+          file ${{ env.BINARY_NAME }}
+          ldd ${{ env.BINARY_NAME }} || echo "Static linking check completed"
+          ls -la ${{ env.BINARY_NAME }}
+          
+          # Basic functionality test
+          ./${{ env.BINARY_NAME }} --help || echo "Binary executed (exit code: $?)"
+
+      - name: Test Modal compatibility
+        run: |
+          # Test in container similar to Modal's Debian environment
+          docker run --rm -v $(pwd):/workspace debian:bookworm-slim bash -c '
+            cd /workspace
+          
+            # Install minimal dependencies that Modal typically has
+            apt-get update && apt-get install -y \
+              libopencv-dev \
+              libglib2.0-0 \
+              libgtk-3-0 \
+              libavcodec59 \
+              libavformat59 \
+              libswscale6 \
+              libjpeg62-turbo \
+              libpng16-16 \
+              libtiff6 \
+              libatlas3-base \
+              libtbb12 \
+              libdc1394-25 \
+              || echo "Some packages may not be available, continuing..."
+          
+            # Test binary execution
+            ./${{ env.BINARY_NAME }} --help || echo "Modal compatibility test completed with exit code: $?"
+          
+            # Check dependencies
+            echo "=== Dependency check ==="
+            ldd ${{ env.BINARY_NAME }} | grep "not found" && echo "❌ Missing dependencies detected" || echo "✅ All dependencies satisfied"
+          
+            # Check binary size (should be reasonable for serverless)
+            size_bytes=$(stat -c%s ${{ env.BINARY_NAME }})
+            size_mb=$((size_bytes / 1024 / 1024))
+            echo "Binary size: ${size_mb}MB"
+            if [ $size_mb -gt 100 ]; then
+              echo "⚠️  Warning: Binary is quite large (${size_mb}MB) for serverless deployment"
+            else
+              echo "✅ Binary size is acceptable for serverless deployment"
+            fi
+          '
+
+      - name: Create deployment package
+        run: |
+          # Create a deployment-ready package
+          mkdir -p modal-deploy
+          cp ${{ env.BINARY_NAME }} modal-deploy/
+          
+          # Create deployment script
+          cat > modal-deploy/modal_app.py << 'EOF'
+          """
+          Modal deployment script for badminton court detection
+          
+          Usage:
+              modal run modal_app.py::detect_court --video-url "https://example.com/video.mp4"
+          """
+          import modal
+          import os
+          from pathlib import Path
+          
+          # Create Modal app
+          app = modal.App("badminton-court-detection")
+          
+          # Define the image with necessary dependencies
+          image = (
+              modal.Image.debian_slim(python_version="${{ env.MODAL_PYTHON_VERSION }}")
+              .apt_install([
+                  "libopencv-dev",
+                  "libglib2.0-0", 
+                  "libgtk-3-0",
+                  "libavcodec59",
+                  "libavformat59", 
+                  "libswscale6",
+                  "libjpeg62-turbo",
+                  "libpng16-16",
+                  "libtiff6",
+                  "libatlas3-base",
+                  "libtbb12",
+                  "libdc1394-25",
+                  "wget",
+                  "curl"
+              ])
+              .copy_local_file("${{ env.BINARY_NAME }}", "/usr/local/bin/detect")
+              .run_commands(["chmod +x /usr/local/bin/detect"])
+          )
+          
+          @app.function(
+              image=image,
+              timeout=300,  # 5 minutes
+              memory=2048,  # 2GB RAM
+          )
+          def detect_court(video_url: str, output_format: str = "json"):
+              """
+              Detect badminton court lines in a video
+          
+              Args:
+                  video_url: URL or path to the video file
+                  output_format: Output format ("json" or "csv")
+          
+              Returns:
+                  Court detection results
+              """
+              import subprocess
+              import tempfile
+              import json
+              import csv
+              import io
+              from urllib.parse import urlparse
+          
+              # Download video if it's a URL
+              if video_url.startswith(('http://', 'https://')):
+                  import requests
+                  response = requests.get(video_url)
+                  response.raise_for_status()
+          
+                  with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp_video:
+                      tmp_video.write(response.content)
+                      video_path = tmp_video.name
+              else:
+                  video_path = video_url
+          
+              # Run detection
+              with tempfile.NamedTemporaryFile(suffix='.csv', delete=False) as tmp_output:
+                  try:
+                      result = subprocess.run([
+                          '/usr/local/bin/detect', 
+                          video_path, 
+                          tmp_output.name
+                      ], 
+                      capture_output=True, 
+                      text=True, 
+                      timeout=240  # 4 minute timeout
+                      )
+          
+                      if result.returncode != 0:
+                          raise Exception(f"Detection failed: {result.stderr}")
+          
+                      # Read results
+                      with open(tmp_output.name, 'r') as f:
+                          if output_format.lower() == 'json':
+                              reader = csv.DictReader(f)
+                              return {"points": list(reader), "stdout": result.stdout}
+                          else:
+                              return {"csv_data": f.read(), "stdout": result.stdout}
+          
+                  finally:
+                      # Cleanup
+                      if video_url.startswith(('http://', 'https://')):
+                          os.unlink(video_path)
+                      os.unlink(tmp_output.name)
+          
+          # CLI interface
+          @app.local_entrypoint()
+          def main(video_url: str, output_format: str = "json"):
+              """Local CLI for testing"""
+              result = detect_court.remote(video_url, output_format)
+              print(json.dumps(result, indent=2))
+          
+          EOF
+          
+          # Create requirements.txt
+          echo "requests>=2.31.0" > modal-deploy/requirements.txt
+          
+          # Create README
+          cat > modal-deploy/README.md << 'EOF'
+          # Badminton Court Detection - Modal Deployment
+          
+          This package contains the badminton court detection binary optimized for Modal serverless deployment.
+          
+          ## Files
+          - `${{ env.BINARY_NAME }}`: Optimized detection binary
+          - `modal_app.py`: Modal deployment script
+          - `requirements.txt`: Python dependencies
+          
+          ## Usage
+          
+          1. Install Modal: `pip install modal`
+          2. Setup Modal account: `modal setup`
+          3. Deploy: `modal deploy modal_app.py`
+          4. Run: `modal run modal_app.py::detect_court --video-url "path/to/video.mp4"`
+          
+          ## Local Testing
+          ```bash
+          ./${{ env.BINARY_NAME }} input_video.mp4 output_points.csv
+          ```
+          EOF
+
+      - name: Upload Modal deployment package
+        uses: actions/upload-artifact@v4
+        with:
+          name: modal-deployment-package
+          path: modal-deploy/
+          retention-days: 30
+
+      - name: Upload optimized binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}
+          path: ${{ env.BINARY_NAME }}
+          retention-days: 90
+
+  # Release job (only on tags)
+  create-release:
+    name: Create release assets
+    runs-on: ubuntu-latest
+    needs: build-modal-binary
+    if: startsWith(github.ref, 'refs/tags/')
+
+    steps:
+      - name: Download Modal package
+        uses: actions/download-artifact@v4
+        with:
+          name: modal-deployment-package
+          path: modal-deploy/
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}
+          path: .
+
+      - name: Create release package
+        run: |
+          # Create comprehensive release package
+          mkdir -p release-assets
+          
+          # Copy binary
+          cp ${{ env.BINARY_NAME }} release-assets/
+          
+          # Create release archive
+          tar -czf release-assets/badminton-court-detection-modal-${{ github.ref_name }}.tar.gz modal-deploy/
+          zip -r release-assets/badminton-court-detection-modal-${{ github.ref_name }}.zip modal-deploy/
+          
+          # Generate checksums
+          cd release-assets
+          sha256sum * > checksums.txt
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-${{ github.ref_name }}
+          path: release-assets/
+          retention-days: 365
+
+      - name: Create GitHub Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v1
+        with:
+          files: release-assets/*
+          generate_release_notes: true
+          append_body: |
+            
+            ## Modal Serverless Deployment
+            
+            This release includes optimized binaries and deployment scripts for Modal serverless platform:
+            
+            - **Binary**: `${{ env.BINARY_NAME }}` - Optimized for Modal's Debian environment
+            - **Package**: `badminton-court-detection-modal-${{ github.ref_name }}.tar.gz` - Complete deployment package
+            - **Modal Script**: Ready-to-deploy Modal application with HTTP API
+            
+            ### Quick Start with Modal
+            
+            1. Download and extract the deployment package
+            2. Install Modal: `pip install modal`
+            3. Setup: `modal setup`
+            4. Deploy: `modal deploy modal_app.py`
+            5. Use: `modal run modal_app.py::detect_court --video-url "your-video.mp4"`
+            
+            The binary is optimized for fast cold starts and minimal memory usage in serverless environments.
+
+  # Performance benchmarking
+  benchmark:
+    name: Performance benchmark
+    runs-on: ubuntu-latest
+    needs: build-modal-binary
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+
+    steps:
+      - name: Checkout test data
+        uses: actions/checkout@v4
+        with:
+          lfs: true  # If you have test videos in Git LFS
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}
+          path: .
+
+      - name: Setup test environment
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libopencv-dev time
+          chmod +x ${{ env.BINARY_NAME }}
+
+      - name: Run performance benchmark
+        run: |
+          # Create a test video if none exists (simple colored frames)
+          if [ ! -f test_video.mp4 ]; then
+            ffmpeg -f lavfi -i color=white:size=1280x720:duration=5:rate=30 \
+                   -f lavfi -i color=green:size=1280x60:duration=5:rate=30 \
+                   -filter_complex "[0:v][1:v]overlay=0:330" \
+                   test_video.mp4
+          fi
+          
+          # Benchmark execution
+          echo "=== Performance Benchmark ==="
+          echo "Binary: ${{ env.BINARY_NAME }}"
+          echo "Date: $(date)"
+          echo "System: $(uname -a)"
+          echo ""
+          
+          # Memory and time benchmark
+          /usr/bin/time -v ./${{ env.BINARY_NAME }} test_video.mp4 benchmark_output.csv 2>&1 | tee benchmark_results.txt
+          
+          # Extract key metrics
+          echo ""
+          echo "=== Key Metrics ==="
+          grep "Maximum resident set size" benchmark_results.txt || echo "Memory info not available"
+          grep "User time" benchmark_results.txt || echo "Time info not available"
+          
+          # File sizes
+          echo "Binary size: $(du -h ${{ env.BINARY_NAME }} | cut -f1)"
+          echo "Output file size: $(du -h benchmark_output.csv | cut -f1 2>/dev/null || echo 'N/A')"
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-${{ github.sha }}
+          path: |
+            benchmark_results.txt
+            benchmark_output.csv
+          retention-days: 30

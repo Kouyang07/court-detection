@@ -40,7 +40,7 @@ int main(int argc, char** argv)
   printVideoInfo(vc);
   Mat frame;
 
-  int totalFrames = int(vc.get(CV_CAP_PROP_FRAME_COUNT));
+  int totalFrames = int(vc.get(cv::CAP_PROP_FRAME_COUNT));
   int startFrame = totalFrames * 0.2; // Start of the middle 60%
   int endFrame = totalFrames * 0.8;   // End of the middle 60%
 
@@ -48,7 +48,7 @@ int main(int argc, char** argv)
   std::srand(std::time(0));
   int frameIndex = startFrame + std::rand() % (endFrame - startFrame);
 
-  vc.set(CV_CAP_PROP_POS_FRAMES, frameIndex);
+  vc.set(cv::CAP_PROP_POS_FRAMES, frameIndex);
   if (!vc.read(frame))
   {
     std::cerr << "Failed to read frame with index " << frameIndex << std::endl;

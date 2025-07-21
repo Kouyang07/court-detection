@@ -55,7 +55,6 @@ P19: Intersection of left sideline and lower doubles line
 P20: Intersection of right sideline and lower doubles line
 P21: Intersection of upper baseline and center service line
 P22: Intersection of lower baseline and center service line
-Additionally, the output includes two net pole positions:
 NetPole1: Left net pole position
 NetPole2: Right net pole position
 ```
